@@ -7,8 +7,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
-import java.nio.charset.StandardCharsets
+
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 class BleService(private val context: Context) {
     private val TAG = "BleService"
@@ -22,17 +23,53 @@ class BleService(private val context: Context) {
     
     private var isAdvertising = false
     private var isScanning = false
-    private var messageCallback: ((String) -> Unit)? = null
+    private var isCurrentlyAdvertising = false
+    private var messageCallback: ((Message) -> Unit)? = null
     private var logCallback: ((LogEntry) -> Unit)? = null
+    
+    // Mesh networking с фрагментацией
+    private val deviceId = "Device-${UUID.randomUUID().toString().take(8)}"
+    private val processedFragments = ConcurrentHashMap<String, Long>() // fragmentId -> timestamp
+    private val retransmissionQueue = mutableListOf<MessageFragment>()
+    private val ownFragmentQueue = mutableListOf<MessageFragment>() // очередь для собственных фрагментов
+    private val fragmentAssembler = FragmentAssembler()
+    private val MESSAGE_EXPIRY_TIME = 5 * 60 * 1000L // 5 минут
+    private val INSTANT_RETRANSMISSION_DELAY = 50L // 50ms для мгновенной ретрансляции
+    private val FRAGMENT_SEND_DELAY = 1200L // 1.2 секунды между фрагментами одного сообщения
     
     init {
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
-        advertiser = bluetoothAdapter?.bluetoothLeAdvertiser
-        scanner = bluetoothAdapter?.bluetoothLeScanner
         
-        addLog("BleService initialized. Adapter: ${bluetoothAdapter != null}, " +
+        if (bluetoothAdapter == null) {
+            addLog("Bluetooth not supported on this device", LogType.ERROR)
+        } else {
+            if (!bluetoothAdapter!!.isEnabled) {
+                addLog("Bluetooth is disabled. Please enable Bluetooth", LogType.ERROR)
+            }
+            
+            advertiser = bluetoothAdapter?.bluetoothLeAdvertiser
+            scanner = bluetoothAdapter?.bluetoothLeScanner
+            
+            if (advertiser == null) {
+                addLog("BLE advertising not supported on this device", LogType.ERROR)
+            }
+            
+            if (scanner == null) {
+                addLog("BLE scanning not supported on this device", LogType.ERROR)
+            }
+        }
+        
+        addLog("BLE Mesh Service with Fragmentation initialized. Device ID: $deviceId", LogType.INFO)
+        addLog("Capabilities - Adapter: ${bluetoothAdapter != null && bluetoothAdapter!!.isEnabled}, " +
                "Advertiser: ${advertiser != null}, Scanner: ${scanner != null}", LogType.DEBUG)
+        
+        // Очистка старых данных каждые 30 секунд
+        startCleanup()
+    }
+    
+    fun setMessageCallback(callback: (Message) -> Unit) {
+        messageCallback = callback
     }
     
     fun setLogCallback(callback: (LogEntry) -> Unit) {
@@ -49,90 +86,214 @@ class BleService(private val context: Context) {
         }
     }
     
-    fun startAdvertising(message: String) {
+    fun sendMessage(text: String) {
+        addLog("Sending message: '$text' (${text.length} chars)", LogType.INFO)
+        
+        // Создаем фрагменты для сообщения
+        val fragments = MessageFragment.fragmentMessage(text, deviceId)
+        
+        addLog("Message fragmented into ${fragments.size} fragments", LogType.DEBUG)
+        
+        // Добавляем фрагменты в обработанные чтобы не ретранслировать свои же
+        fragments.forEach { fragment ->
+            val fragmentId = "${fragment.messageId}_${fragment.fragmentIndex}"
+            processedFragments[fragmentId] = System.currentTimeMillis()
+        }
+        
+        // Показываем собранное сообщение в UI сразу
+        val completeMessage = Message(
+            id = fragments.first().messageId,
+            text = text,
+            timestamp = fragments.first().timestamp,
+            senderId = deviceId,
+            hops = 0
+        )
+        messageCallback?.invoke(completeMessage)
+        
+        // Добавляем фрагменты в очередь для последовательной отправки
+        ownFragmentQueue.addAll(fragments)
+        
+        // Запускаем отправку если очередь не была активна
+        if (ownFragmentQueue.size == fragments.size) {
+            processOwnFragmentQueue()
+        }
+    }
+    
+    private fun advertiseFragment(fragment: MessageFragment) {
         if (advertiser == null) {
             addLog("BLE advertising not supported", LogType.ERROR)
             return
         }
         
-        stopAdvertising()
+        val dataBytes = fragment.toCompactBytes()
+        
+        if (dataBytes.size > 20) {
+            addLog("Fragment too large: ${dataBytes.size} bytes", LogType.ERROR)
+            return
+        }
         
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY) // Максимальная скорость
             .setConnectable(false)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setTimeout(0)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH) // Максимальная мощность
+            .setTimeout(1000) // Короткий timeout для быстрого переключения
             .build()
             
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(PARCEL_UUID)
-            .addServiceData(PARCEL_UUID, message.toByteArray(StandardCharsets.UTF_8))
+            .addServiceData(PARCEL_UUID, dataBytes)
             .build()
             
-        addLog("Starting advertising with message: $message", LogType.DEBUG)
+        addLog("Advertising fragment ${fragment.fragmentIndex}/${fragment.totalFragments} of message", LogType.DEBUG)
         advertiser?.startAdvertising(settings, data, advertiseCallback)
-        isAdvertising = true
-        
-        handler.postDelayed({
-            if (isAdvertising) {
-                startAdvertising(message)
-            }
-        }, 5000)
     }
     
-    fun stopAdvertising() {
-        if (isAdvertising) {
-            addLog("Stopping advertising", LogType.DEBUG)
-            advertiser?.stopAdvertising(advertiseCallback)
-            isAdvertising = false
-            handler.removeCallbacksAndMessages(null)
+    private fun processOwnFragmentQueue() {
+        if (ownFragmentQueue.isNotEmpty() && !isCurrentlyAdvertising) {
+            val fragment = ownFragmentQueue.removeAt(0)
+            addLog("Sending own fragment ${fragment.fragmentIndex}/${fragment.totalFragments}", LogType.DEBUG)
+            advertiseFragment(fragment)
+            
+            // Планируем отправку следующего фрагмента
+            handler.postDelayed({
+                processOwnFragmentQueue()
+            }, FRAGMENT_SEND_DELAY)
         }
     }
+
+    fun startMeshNetwork() {
+        addLog("Starting BLE Mesh Network with Instant Retransmission", LogType.INFO)
+        startScanning()
+        isAdvertising = true
+        processRetransmissionQueue()
+    }
     
-    fun startScanning(onMessageReceived: (String) -> Unit) {
+    fun stopMeshNetwork() {
+        addLog("Stopping BLE Mesh Network", LogType.INFO)
+        stopScanning()
+        stopCurrentAdvertising()
+        isAdvertising = false
+        retransmissionQueue.clear()
+        ownFragmentQueue.clear()
+        handler.removeCallbacksAndMessages(null)
+    }
+    
+    private fun startScanning() {
         if (scanner == null) {
             addLog("BLE scanning not supported", LogType.ERROR)
             return
         }
         
-        messageCallback = onMessageReceived
-        stopScanning()
+        if (isScanning) return
         
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setReportDelay(0)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY) // Максимальная скорость сканирования
+            .setReportDelay(0) // Мгновенные отчеты
             .build()
         
-        val filters = emptyList<ScanFilter>()
+        val filters = listOf(
+            ScanFilter.Builder()
+                .setServiceUuid(PARCEL_UUID)
+                .build()
+        )
         
-        addLog("Starting scanning", LogType.DEBUG)
+        addLog("Starting high-speed BLE scanning for fragments", LogType.DEBUG)
         scanner?.startScan(filters, settings, scanCallback)
         isScanning = true
     }
     
-    fun stopScanning() {
+    private fun stopScanning() {
         if (isScanning) {
-            addLog("Stopping scanning", LogType.DEBUG)
+            addLog("Stopping BLE scanning", LogType.DEBUG)
             scanner?.stopScan(scanCallback)
             isScanning = false
-            messageCallback = null
-            handler.removeCallbacksAndMessages(null)
         }
+    }
+    
+    private fun stopCurrentAdvertising() {
+        if (isCurrentlyAdvertising) {
+            addLog("Stopping current advertising", LogType.DEBUG)
+            advertiser?.stopAdvertising(advertiseCallback)
+            isCurrentlyAdvertising = false
+        }
+    }
+    
+    private fun processRetransmissionQueue() {
+        handler.postDelayed({
+            // Приоритет у собственных фрагментов
+            if (isAdvertising && ownFragmentQueue.isEmpty() && retransmissionQueue.isNotEmpty() && !isCurrentlyAdvertising) {
+                val fragment = retransmissionQueue.removeAt(0)
+                if (!fragment.isExpired()) {
+                    advertiseFragment(fragment)
+                } else {
+                    addLog("Removing expired fragment from queue", LogType.DEBUG)
+                }
+            }
+            if (isAdvertising) {
+                processRetransmissionQueue()
+            }
+        }, INSTANT_RETRANSMISSION_DELAY) // Мгновенная ретрансляция!
+    }
+    
+    private fun startCleanup() {
+        handler.postDelayed({
+            val currentTime = System.currentTimeMillis()
+            
+            // Очистка старых фрагментов
+            val fragmentIterator = processedFragments.entries.iterator()
+            while (fragmentIterator.hasNext()) {
+                val entry = fragmentIterator.next()
+                if (currentTime - entry.value > MESSAGE_EXPIRY_TIME) {
+                    fragmentIterator.remove()
+                }
+            }
+            
+            // Очистка неполных сообщений
+            fragmentAssembler.cleanup()
+            
+            startCleanup()
+        }, 30000) // каждые 30 секунд
     }
     
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            addLog("Advertising started successfully")
+            addLog("Fragment advertising started", LogType.DEBUG)
+            isCurrentlyAdvertising = true
+            // Автоматически сбрасываем флаг через timeout
+            handler.postDelayed({
+                isCurrentlyAdvertising = false
+                addLog("Fragment advertising completed", LogType.DEBUG)
+                
+                // Обрабатываем очереди после завершения advertising
+                if (ownFragmentQueue.isNotEmpty()) {
+                    processOwnFragmentQueue()
+                } else if (retransmissionQueue.isNotEmpty()) {
+                    processRetransmissionQueue()
+                }
+            }, settingsInEffect.timeout.toLong())
         }
         
         override fun onStartFailure(errorCode: Int) {
-            addLog("Advertising failed to start: $errorCode", LogType.ERROR)
+            isCurrentlyAdvertising = false
+            val errorMsg = when (errorCode) {
+                ADVERTISE_FAILED_DATA_TOO_LARGE -> "Data too large"
+                ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "Too many advertisers"
+                ADVERTISE_FAILED_ALREADY_STARTED -> "Already started"
+                ADVERTISE_FAILED_INTERNAL_ERROR -> "Internal error"
+                ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "Feature unsupported"
+                else -> "Unknown error ($errorCode)"
+            }
+            addLog("Fragment advertising failed: $errorMsg", LogType.ERROR)
+            
+            // Повторная попытка с приоритетом для собственных фрагментов
             handler.postDelayed({
-                if (!isAdvertising) {
-                    startAdvertising("")
+                if (ownFragmentQueue.isNotEmpty()) {
+                    processOwnFragmentQueue()
+                } else if (retransmissionQueue.isNotEmpty()) {
+                    processRetransmissionQueue()
                 }
-            }, 1000)
+            }, 500) // 500ms задержка при ошибке
         }
     }
     
@@ -140,37 +301,69 @@ class BleService(private val context: Context) {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val scanRecord = result.scanRecord
             val deviceAddress = result.device?.address ?: "unknown"
-            addLog("BLE packet from $deviceAddress, RSSI: ${result.rssi}, raw: ${scanRecord?.bytes?.joinToString { String.format("%02X", it) }}", LogType.DEBUG)
-
-            scanRecord?.serviceUuids?.forEach { uuid ->
-                addLog("Service UUID: $uuid", LogType.DEBUG)
-            }
-            scanRecord?.serviceData?.forEach { (uuid, data) ->
-                addLog("ServiceData for $uuid: ${data.joinToString { String.format("%02X", it) }}", LogType.DEBUG)
-            }
-            scanRecord?.manufacturerSpecificData?.let { msd ->
-                for (i in 0 until msd.size()) {
-                    val id = msd.keyAt(i)
-                    val data = msd.valueAt(i)
-                    addLog("ManufacturerData id=$id: ${data.joinToString { String.format("%02X", it) }}", LogType.DEBUG)
-                }
-            }
-
+            
             val serviceData = scanRecord?.getServiceData(PARCEL_UUID)
             if (serviceData != null) {
-                val message = String(serviceData, StandardCharsets.UTF_8)
-                addLog("Received message: $message from device: $deviceAddress")
-                messageCallback?.invoke(message)
+                val fragment = MessageFragment.fromCompactBytes(serviceData)
+                if (fragment != null) {
+                    handleReceivedFragment(fragment, deviceAddress)
+                } else {
+                    addLog("Failed to parse fragment from $deviceAddress", LogType.ERROR)
+                }
             }
         }
         
         override fun onScanFailed(errorCode: Int) {
-            addLog("Scan failed with error: $errorCode", LogType.ERROR)
+            addLog("BLE scan failed: $errorCode", LogType.ERROR)
+            // Быстрый перезапуск сканирования
             handler.postDelayed({
-                if (isScanning) {
-                    startScanning(messageCallback ?: return@postDelayed)
+                if (isAdvertising) {
+                    startScanning()
                 }
-            }, 1000)
+            }, 500) // Всего 500ms задержка при ошибке сканирования
+        }
+    }
+    
+    private fun handleReceivedFragment(fragment: MessageFragment, fromDevice: String) {
+        val fragmentId = "${fragment.messageId}_${fragment.fragmentIndex}"
+        
+        // Проверяем, не обрабатывали ли мы уже этот фрагмент
+        if (processedFragments.containsKey(fragmentId)) {
+            addLog("Duplicate fragment ignored: $fragmentId", LogType.DEBUG)
+            return
+        }
+        
+        // Проверяем, не от себя ли фрагмент
+        if (fragment.originalSenderId == deviceId) {
+            addLog("Ignoring own fragment", LogType.DEBUG)
+            return
+        }
+        
+        // Проверяем TTL
+        if (fragment.isExpired()) {
+            addLog("Fragment expired (TTL=0): $fragmentId", LogType.DEBUG)
+            return
+        }
+        
+        addLog("Received fragment ${fragment.fragmentIndex}/${fragment.totalFragments} from $fromDevice (TTL: ${fragment.ttl}, Hops: ${fragment.hops})", LogType.DEBUG)
+        
+        // Отмечаем фрагмент как обработанный
+        processedFragments[fragmentId] = System.currentTimeMillis()
+        
+        // Пытаемся собрать полное сообщение
+        val completeMessage = fragmentAssembler.addFragment(fragment)
+        if (completeMessage != null) {
+            addLog("Complete message assembled: '${completeMessage.text}' (${completeMessage.text.length} chars)", LogType.INFO)
+            messageCallback?.invoke(completeMessage)
+        }
+        
+        // МГНОВЕННАЯ ретрансляция фрагмента с уменьшенным TTL
+        if (fragment.ttl > 1) {
+            val retransmitFragment = fragment.decrementTtl()
+            addLog("Queuing fragment for instant retransmission: $fragmentId (new TTL: ${retransmitFragment.ttl})", LogType.DEBUG)
+            retransmissionQueue.add(retransmitFragment)
+        } else {
+            addLog("Fragment reached TTL limit, not retransmitting: $fragmentId", LogType.DEBUG)
         }
     }
 } 
